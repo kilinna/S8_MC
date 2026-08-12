@@ -1,0 +1,269 @@
+name: PawsKernel - S8 G950F Profile A (No GPU Governor Change)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: Build PawsKernel A (No GPU Governor Change)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            flex \
+            libelf-dev \
+            libncurses5-dev \
+            libssl-dev \
+            python3 \
+            zip
+
+      - name: Setup GCC 4.9
+        run: |
+          set -e
+
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
+            toolchain
+
+          GCC_BIN="$(find "$GITHUB_WORKSPACE/toolchain" \
+            -type f \
+            -name 'aarch64-linux-android-gcc' \
+            -print -quit)"
+
+          if [ -z "$GCC_BIN" ]; then
+            echo "ERROR: aarch64-linux-android-gcc was not found."
+            echo "Toolchain tree:"
+            find "$GITHUB_WORKSPACE/toolchain" -maxdepth 8 -type f | head -200
+            exit 1
+          fi
+
+          GCC_DIR="$(dirname "$GCC_BIN")"
+
+          echo "$GCC_DIR" >> "$GITHUB_PATH"
+
+          echo "CROSS_COMPILE=$GCC_DIR/aarch64-linux-android-" >> "$GITHUB_ENV"
+
+          chmod +x "$GCC_BIN" || true
+
+          echo "Compiler:"
+          "$GCC_BIN" --version
+
+      - name: Verify source
+        run: |
+          set -e
+
+          test -f Makefile
+          test -f arch/arm64/configs/exynos8895-dreamlte_defconfig
+          test -f arch/arm64/boot/dts/exynos/exynos8895.dtsi
+
+          echo "Kernel source: OK"
+
+          if grep -Riq "booster" arch/arm64 drivers 2>/dev/null; then
+            echo "BOOSTER governor/source: FOUND"
+          else
+            echo "ERROR: BOOSTER governor/source not found"
+            exit 1
+          fi
+
+      - name: Configure kernel
+        run: |
+          set -e
+
+          make O=out \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            exynos8895-dreamlte_defconfig
+
+          echo "===== BASE CONFIG ====="
+          grep -E \
+            'CONFIG_CPU_FREQ_DEFAULT_GOV_|CONFIG_CPU_FREQ_GOV_|CONFIG_DEFAULT_TCP_CONG|CONFIG_ZRAM|CONFIG_ZSMALLOC' \
+            out/.config || true
+
+      - name: Apply PawsKernel Profile A
+        run: |
+          set -e
+
+          ./scripts/config \
+            --file out/.config \
+            -e CPU_FREQ_GOV_PERFORMANCE
+
+          ./scripts/config \
+            --file out/.config \
+            -e CPU_FREQ_DEFAULT_GOV_PERFORMANCE
+
+          ./scripts/config \
+            --file out/.config \
+            -d CPU_FREQ_DEFAULT_GOV_INTERACTIVE
+
+          ./scripts/config \
+            --file out/.config \
+            --set-str DEFAULT_TCP_CONG cubic
+
+          if grep -q '^CONFIG_ZRAM=' out/.config; then
+            ./scripts/config \
+              --file out/.config \
+              -e ZRAM
+          fi
+
+          if grep -q '^CONFIG_ZSMALLOC=' out/.config; then
+            ./scripts/config \
+              --file out/.config \
+              -e ZSMALLOC
+          fi
+
+          make O=out \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            olddefconfig
+
+          echo "===== FINAL PROFILE A CONFIG ====="
+          grep -E \
+            'CONFIG_CPU_FREQ_DEFAULT_GOV_|CONFIG_CPU_FREQ_GOV_|CONFIG_DEFAULT_TCP_CONG|CONFIG_ZRAM|CONFIG_ZSMALLOC' \
+            out/.config || true
+
+      - name: Verify no explicit OC patch
+        run: |
+          set -e
+
+          echo "Profile A uses the source frequency tables."
+          echo "No CPU/GPU frequency override is applied by this workflow."
+
+          grep -n \
+            'gpu_max_clock\|gpu_max_clock_limit' \
+            arch/arm64/boot/dts/exynos/exynos8895.dtsi || true
+
+      - name: Build kernel
+        run: |
+          set -e
+
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE"
+
+      - name: Build Image.gz-dtb
+        run: |
+          set -e
+
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            Image.gz-dtb
+
+          test -f out/arch/arm64/boot/Image.gz-dtb
+
+          echo "Image.gz-dtb:"
+          ls -lh out/arch/arm64/boot/Image.gz-dtb
+
+      - name: Build DTB image
+        run: |
+          set -e
+
+          if grep -q '^CONFIG_EXYNOS_DTBTOOL=y' out/.config; then
+            make -j"$(nproc)" \
+              O=out \
+              ARCH=arm64 \
+              CROSS_COMPILE="$CROSS_COMPILE" \
+              dtb.img
+          else
+            echo "CONFIG_EXYNOS_DTBTOOL is not enabled; skipping dtb.img."
+          fi
+
+      - name: Verify build output
+        run: |
+          set -e
+
+          test -f out/arch/arm64/boot/Image.gz-dtb
+
+          echo "===== OUTPUT ====="
+          ls -lh out/arch/arm64/boot/Image.gz-dtb
+          ls -lh out/.config
+
+          if [ -f out/arch/arm64/boot/dtb.img ]; then
+            ls -lh out/arch/arm64/boot/dtb.img
+          fi
+
+          echo "Kernel release:"
+          cat out/include/config/kernel.release
+
+      - name: Prepare artifact
+        run: |
+          set -e
+
+          rm -rf artifact
+          mkdir -p artifact
+
+          cp \
+            out/arch/arm64/boot/Image.gz-dtb \
+            artifact/Image.gz-dtb
+
+          cp \
+            out/.config \
+            artifact/kernel.config
+
+          if [ -f out/arch/arm64/boot/dtb.img ]; then
+            cp \
+              out/arch/arm64/boot/dtb.img \
+              artifact/dtb.img
+          fi
+
+          printf '%s\n' \
+            'PawsKernel' \
+            'Galaxy S8 G950F / DreamLTE' \
+            'Profile A' \
+            '' \
+            'CPU frequency: STOCK' \
+            'GPU frequency: STOCK' \
+            'CPU governor: performance' \
+            'GPU governor: booster' \
+            'TCP: cubic' \
+            'ZRAM: enabled when supported' \
+            'Thermal safety: RETAINED' \
+            'CPU OC: NONE' \
+            'GPU OC: NONE' \
+            > artifact/PawsKernel-A.txt
+
+      - name: Package PawsKernel
+        run: |
+          set -e
+
+          cd artifact
+
+          zip -9 \
+            ../PawsKernel-G950F-A.zip \
+            Image.gz-dtb \
+            kernel.config \
+            PawsKernel-A.txt
+
+          if [ -f dtb.img ]; then
+            zip -9 \
+              ../PawsKernel-G950F-A.zip \
+              dtb.img
+          fi
+
+          cd ..
+
+          ls -lh PawsKernel-G950F-A.zip
+
+      - name: Upload PawsKernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: PawsKernel-G950F-A
+          path: PawsKernel-G950F-A.zip
+          if-no-files-found: error
